@@ -36,6 +36,13 @@ static void zeConstructError(const char *file, int line, const char *message) {
   PyGILState_Release(gil_state);
 }
 
+struct L0KernelBundle {
+  ze_module_handle_t module;
+  ze_kernel_handle_t kernel;
+  ze_context_handle_t context;
+  ze_device_handle_t device;
+};
+
 template <typename T>
 static inline T
 checkZeCodeAndSetPyErr(const std::tuple<T, ze_result_t> syclTuple,
@@ -54,19 +61,15 @@ extern "C" EXPORT_FUNC PyObject *get_device_properties(int device_id) {
     return NULL;
   }
   const auto device = g_sycl_l0_device_list[device_id];
-
-  // Get device handle
   ze_device_handle_t phDevice = device.second;
 
-  // create a struct to hold device properties
   ze_device_properties_t device_properties = {};
   device_properties.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
   zeDeviceGetProperties(phDevice, &device_properties);
 
   int multiprocessor_count =
       device_properties.numSlices * device_properties.numSubslicesPerSlice;
-  // To align with other backends - convert MHz to KHz
-  int sm_clock_rate = device_properties.coreClockRate * 1000;
+  int sm_clock_rate = device_properties.coreClockRate * 1000; // MHz -> KHz
 
   ze_device_compute_properties_t compute_properties = {};
   compute_properties.stype = ZE_STRUCTURE_TYPE_DEVICE_COMPUTE_PROPERTIES;
@@ -89,9 +92,7 @@ extern "C" EXPORT_FUNC PyObject *get_device_properties(int device_id) {
   }
   zeDeviceGetMemoryProperties(phDevice, &memoryCount, pMemoryProperties);
 
-  // To align with other backends - convert MHz to KHz
-  // https://github.com/intel/compute-runtime/blob/cfa007e5519d3a038d726b62237b86fca9a49e2c/shared/source/xe_hpc_core/linux/product_helper_pvc.cpp#L51
-  int mem_clock_rate = pMemoryProperties[0].maxClockRate * 1000;
+  int mem_clock_rate = pMemoryProperties[0].maxClockRate * 1000; // MHz -> KHz
   int mem_bus_width = pMemoryProperties[0].maxBusWidth;
 
   delete[] pMemoryProperties;
@@ -114,6 +115,20 @@ void freeKernelBundle(PyObject *p) {
       PyCapsule_GetPointer(p, "kernel_bundle"));
 }
 
+void freeL0KernelBundle(PyObject *p) {
+  L0KernelBundle *bundle = reinterpret_cast<L0KernelBundle*>(
+      PyCapsule_GetPointer(p, "l0_kernel_bundle"));
+  if (bundle) {
+    if (bundle->kernel) {
+      zeKernelDestroy(bundle->kernel);
+    }
+    if (bundle->module) {
+      zeModuleDestroy(bundle->module);
+    }
+    delete bundle;
+  }
+}
+
 using Spills = int32_t;
 
 template <typename L0_DEVICE, typename L0_CONTEXT>
@@ -130,7 +145,6 @@ compileLevelZeroObjects(uint8_t *binary_ptr, const size_t binary_size,
     return std::make_tuple(nullptr, nullptr, -1);
   }
 
-  // Retrieve the kernel properties (e.g. register spills).
   auto l0_kernel = checkZeCodeAndSetPyErr(
       create_function(l0_module, kernel_name), __FILE__, __LINE__);
   if (PyErr_Occurred()) {
@@ -235,7 +249,6 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
 
   if (!PyArg_ParseTuple(args, "sSispi", &name, &py_bytes, &shared,
                         &build_flags_ptr, &is_spv, &devId)) {
-    // PyArg_ParseTuple will set a PyErr
     return NULL;
   }
 
@@ -269,12 +282,8 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
 
   const bool debugEnabled = getBoolEnv("TRITON_DEBUG");
 
-  // If the initial compilation failed entirely (e.g., scratch space exceeds
-  // HW limit), and GRF mode was not explicitly set, retry with large GRF mode.
-  // This handles cases where the default GRF mode doesn't provide enough
-  // registers, causing the backend compiler to fail.
+  // Retry with large GRF mode if compilation failed and GRF mode was not explicitly set.
   if (PyErr_Occurred() && is_spv && !build_flags.hasGRFSizeFlag()) {
-    // Save the original error before clearing it for the retry attempt.
     PyObject *orig_type, *orig_value, *orig_tb;
     PyErr_Fetch(&orig_type, &orig_value, &orig_tb);
 
@@ -288,12 +297,10 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
         compileLevelZeroObjects(binary_ptr, binary_size, kernel_name, l0_device,
                                 l0_context, build_flags(), is_spv);
     if (PyErr_Occurred()) {
-      // Retry also failed — propagate the original error.
       PyErr_Restore(orig_type, orig_value, orig_tb);
       return NULL;
     }
 
-    // Retry succeeded — discard the saved original error.
     Py_XDECREF(orig_type);
     Py_XDECREF(orig_value);
     Py_XDECREF(orig_tb);
@@ -302,8 +309,6 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
     l0_kernel = l0_kernel_retry;
     n_spills = n_spills_retry;
 
-    // Always print recovery message to stderr to follow up on the
-    // "L0 build module failed" error that was already printed.
     std::cerr << "(I): Build failure recovered by retrying with large GRF "
                  "mode for \""
               << kernel_name << "\"" << std::endl;
@@ -311,6 +316,27 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
     if (debugEnabled)
       std::cout << "(I): Retry with large GRF succeeded, kernel has "
                 << n_spills << " spills" << std::endl;
+
+    auto n_regs = build_flags.n_regs();
+
+    zeKernelSetIndirectAccess(
+        l0_kernel,
+        ZE_KERNEL_INDIRECT_ACCESS_FLAG_HOST |
+        ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE |
+        ZE_KERNEL_INDIRECT_ACCESS_FLAG_SHARED);
+
+    L0KernelBundle *bundle = new L0KernelBundle();
+    bundle->module = l0_module;
+    bundle->kernel = l0_kernel;
+    bundle->context = l0_context;
+    bundle->device = l0_device;
+
+    auto l0_kernel_bundle_py = PyCapsule_New(
+        reinterpret_cast<void *>(bundle), "l0_kernel_bundle", freeL0KernelBundle);
+
+    last_build_flag = build_flags;
+    return Py_BuildValue("(OOiii)", l0_kernel_bundle_py, l0_kernel_bundle_py,
+                         n_regs, n_spills, n_max_threads);
   } else if (PyErr_Occurred()) {
     return NULL;
   }
@@ -319,8 +345,6 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
     constexpr int32_t max_reg_spill = 1000;
     const bool is_GRF_mode_specified = build_flags.hasGRFSizeFlag();
 
-    // If the register mode isn't set, and the number of spills is greater
-    // than the threshold, recompile the kernel using large GRF mode.
     if (!is_GRF_mode_specified && n_spills > max_reg_spill) {
       if (debugEnabled)
         std::cout << "(I): Detected " << n_spills
@@ -343,7 +367,6 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
         std::swap(l0_kernel, l0_kernel_dgrf);
         std::swap(n_spills, n_spills_dgrf);
 
-        // clean up the unused module and kernel.
         auto error_no = zeKernelDestroy(l0_kernel_dgrf);
         if (error_no != ZE_RESULT_SUCCESS) {
           PyErr_WarnEx(
@@ -362,7 +385,6 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
                     "large registers: ");
         strcat(buf, e.what());
         PyErr_WarnEx(PyExc_RuntimeWarning, buf, 1);
-        // construct previous working version
         build_flags = BuildFlags(build_flags_ptr);
       }
     }
@@ -375,22 +397,24 @@ extern "C" EXPORT_FUNC PyObject *load_binary(PyObject *args) {
 
   auto n_regs = build_flags.n_regs();
 
-  auto mod = new sycl::kernel_bundle<sycl::bundle_state::executable>(
-      sycl::make_kernel_bundle<sycl::backend::ext_oneapi_level_zero,
-                               sycl::bundle_state::executable>(
-          {l0_module, sycl::ext::oneapi::level_zero::ownership::transfer},
-          ctx));
-  sycl::kernel *fun =
-      new sycl::kernel(sycl::make_kernel<sycl::backend::ext_oneapi_level_zero>(
-          {*mod, l0_kernel, sycl::ext::oneapi::level_zero::ownership::transfer},
-          ctx));
-  auto kernel_py =
-      PyCapsule_New(reinterpret_cast<void *>(fun), "kernel", freeKernel);
-  auto kernel_bundle_py = PyCapsule_New(reinterpret_cast<void *>(mod),
-                                        "kernel_bundle", freeKernelBundle);
+  zeKernelSetIndirectAccess(
+      l0_kernel,
+      ZE_KERNEL_INDIRECT_ACCESS_FLAG_HOST |
+      ZE_KERNEL_INDIRECT_ACCESS_FLAG_DEVICE |
+      ZE_KERNEL_INDIRECT_ACCESS_FLAG_SHARED);
+
+  L0KernelBundle *bundle = new L0KernelBundle();
+  bundle->module = l0_module;
+  bundle->kernel = l0_kernel;
+  bundle->context = l0_context;
+  bundle->device = l0_device;
+
+  auto l0_kernel_bundle_py = PyCapsule_New(
+      reinterpret_cast<void *>(bundle), "l0_kernel_bundle", freeL0KernelBundle);
+
   last_build_flag = build_flags;
-  return Py_BuildValue("(OOiii)", kernel_bundle_py, kernel_py, n_regs, n_spills,
-                       n_max_threads);
+  return Py_BuildValue("(OOiii)", l0_kernel_bundle_py, l0_kernel_bundle_py, n_regs,
+                       n_spills, n_max_threads);
 }
 
 extern "C" EXPORT_FUNC PyObject *init_devices(PyObject *cap) {
@@ -403,11 +427,8 @@ extern "C" EXPORT_FUNC PyObject *init_devices(PyObject *cap) {
   sycl::queue *sycl_queue = static_cast<sycl::queue *>(queue);
 
   auto sycl_context = sycl_queue->get_context();
-
-  // Get sycl-device
   const std::vector<sycl::device> &sycl_devices = sycl_context.get_devices();
 
-  // Retrieve l0 devices
   const uint32_t deviceCount = sycl_devices.size();
   for (uint32_t i = 0; i < deviceCount; ++i) {
     g_sycl_l0_device_list.push_back(std::make_pair(

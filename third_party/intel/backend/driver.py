@@ -19,9 +19,6 @@ from triton.backends.driver import expand_signature as upstream_expand_signature
 from triton._C.libtriton import make_tensordesc_args
 from triton._utils import find_paths_if
 
-# A hard-coded cache version that can be updated when we know that the cached file is invalid and
-# there are no other ways to detect that the runtime environment has changed. For example, a shared
-# library has been updated as a result of updated dependencies.
 # See https://github.com/intel/intel-xpu-backend-for-triton/issues/3095.
 __CACHE_VERSION = "1"
 
@@ -45,7 +42,6 @@ def find_sycl(include_dir: list[str]) -> tuple[list[str], list[str]]:
                          "or install `intel-sycl-rt>=2025.0.0` wheel")
     icpx_path = shutil.which("icpx")
     if icpx_path:
-        # only `icpx` compiler knows where sycl runtime binaries and header files are
         compiler_root = os.path.abspath(f"{icpx_path}/../..")
         include_dir += [os.path.join(compiler_root, "include"), os.path.join(compiler_root, "include/sycl")]
         sycl_dir = os.path.join(compiler_root, "lib")
@@ -70,14 +66,11 @@ def find_sycl(include_dir: list[str]) -> tuple[list[str], list[str]]:
 
     sycl_dirs = []
     for f in importlib.metadata.files("intel-sycl-rt"):
-        # sycl/sycl.hpp and sycl/CL/sycl.hpp results in both folders
-        # being add: include and include/sycl.
         if "sycl.hpp" in f.name:
             include_dir += [str(f.locate().parent.parent.resolve())]
         if any(map(lambda el: el in f.name, ("libsycl.so", "sycl.lib"))):
             sycl_dir = f.locate().parent.resolve()
             if os.name == "nt":
-                # for sycl8.dll loading on Windows
                 dll_path = sycl_dir.parent.joinpath("bin")
                 sycl_dirs.append(str(dll_path))
                 _ = os.add_dll_directory(str(dll_path))
@@ -209,10 +202,6 @@ class SpirvUtils:
         return super().__getattribute__(name)
 
     def load_binary(self, *args):
-        # if we don't use parameter passing in this way,
-        # we will need to rewrite the line in the general part of the code:
-        # driver.active.utils.load_binary(self.name, self.kernel, self.metadata.shared, self.metadata.build_flags, device) ->
-        # driver.active.utils.load_binary((self.name, self.kernel, self.metadata.shared, self.metadata.build_flags, device))
         try:
             return self.shared_library.load_binary(args)
         except Exception as e:
@@ -338,12 +327,7 @@ def compile_module_from_src(src: str, name: str):
     return _load_module_from_path(name, cache_path)
 
 
-# ------------------------
-# Utils
-# ------------------------
-
-
-class XPUUtils(object):
+class XPUUtils:
 
     def __new__(cls):
         if not hasattr(cls, "instance"):
@@ -352,8 +336,7 @@ class XPUUtils(object):
 
     def __init__(self):
         dirname = os.path.dirname(os.path.realpath(__file__))
-        # we save `spirv_utils` module so that the destructor is not called prematurely, which will unload the dll
-        # and can cause `Fatal Python error: Segmentation fault`
+        # Keep reference to prevent premature DLL unload (segfault)
         mod = compile_module_from_src(src=Path(os.path.join(dirname, "driver.c")).read_text(), name="spirv_utils")
         self.load_binary = mod.load_binary
         self.get_device_properties = mod.get_device_properties
@@ -375,13 +358,8 @@ class XPUUtils(object):
         self.wait_on_sycl_queue(self.get_sycl_queue())
 
     def memset(self, ptr, value, count):
-        """Wrapper for SYCL queue memset"""
         return self.sycl_queue_memset((self.get_sycl_queue(), ptr, value, count))
 
-
-# ------------------------
-# Launcher
-# ------------------------
 
 
 def ty_to_cpp(ty):
@@ -477,8 +455,6 @@ def make_launcher(constants, signature):
         _flatten_signature(sig, flat_signature)
     signature = {i: s for i, s in enumerate(flat_signature)}
     args_list = ', ' + ', '.join(f"&_arg{i}" for i, ty in signature.items()) if len(signature) > 0 else ''
-    # Record the end of regular arguments;
-    # subsequent arguments are architecture-specific descriptors.
     arg_decl_list = []
     for i, ty in signature.items():
         if ty == "constexpr":
@@ -497,7 +473,6 @@ def make_launcher(constants, signature):
         elif ty != "constexpr":
             internal_args_list.append(f"_arg{i}")
 
-    # generate glue code
     newline = '\n  '
     ptr_decls = [
         f"DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i}, stream); if (!ptr_info{i}.valid) return NULL;"
@@ -518,12 +493,16 @@ def make_launcher(constants, signature):
         params_decl = f"void *params[] = {{ {', '.join(params)} }};"
     src = f"""
 #include <cstddef>
-#include <Python.h>
 #include <string>
 #include <iostream>
 #include <iomanip>
 #include <level_zero/ze_api.h>
+#include <level_zero/zer_api.h>
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <unordered_map>
+#include <variant>
+#include <Python.h>
 { "#include <ATen/record_function.h>" if COMPILATION_HELPER.inject_pytorch_dep else "" }
 
 #if defined(_WIN32)
@@ -531,9 +510,6 @@ def make_launcher(constants, signature):
 #else
 #define EXPORT_FUNC __attribute__((visibility("default")))
 #endif
-
-#include <Python.h>
-#include <stdio.h>
 
 namespace {{
 
@@ -563,6 +539,57 @@ static inline void gpuAssert(ze_result_t code, const char *file, int line)
 
 #define ZE_CHECK(ans) {{ gpuAssert((ans), __FILE__, __LINE__); }}
 
+struct L0KernelBundle {{
+  ze_module_handle_t module;
+  ze_kernel_handle_t kernel;
+  ze_context_handle_t context;
+  ze_device_handle_t device;
+}};
+
+struct L0DeviceState {{
+  ze_context_handle_t ze_ctx;
+  ze_device_handle_t  ze_dev;
+  ze_command_list_handle_t imm_cmdl;
+}};
+
+static thread_local std::unordered_map<ze_device_handle_t, L0DeviceState> tls_device_state_cache;
+static thread_local const L0DeviceState* tls_fast_l0_state = nullptr;
+
+static const L0DeviceState& get_or_create_l0_state(sycl::queue& q) {{
+  if (tls_fast_l0_state) {{
+    return *tls_fast_l0_state;
+  }}
+
+  auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+
+  auto it = tls_device_state_cache.find(ze_dev);
+  if (it != tls_device_state_cache.end()) {{
+    tls_fast_l0_state = &it->second;
+    return it->second;
+  }}
+
+  auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+
+  auto native_handle = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q);
+  ze_command_list_handle_t imm_cmdl = nullptr;
+  if (auto* cmdl = std::get_if<ze_command_list_handle_t>(&native_handle)) {{
+    imm_cmdl = *cmdl;
+  }} else if (auto* cmdq = std::get_if<ze_command_queue_handle_t>(&native_handle)) {{
+    imm_cmdl = reinterpret_cast<ze_command_list_handle_t>(*cmdq);
+  }}
+
+  if (imm_cmdl == nullptr) {{
+    fprintf(stderr, "[L0 ERROR] Failed to extract command list from SYCL queue\\n");
+    abort();
+  }}
+
+  L0DeviceState state{{ze_ctx, ze_dev, imm_cmdl}};
+  auto [ins_it, ins_ok] = tls_device_state_cache.emplace(ze_dev, state);
+  tls_fast_l0_state = &ins_it->second;
+
+  return ins_it->second;
+}}
+
 typedef struct _DevicePtrInfo {{
   void* dev_ptr;
   bool valid;
@@ -584,8 +611,6 @@ static inline void checkDevicePointer(DevicePtrInfo *ptr_info, int idx, const sy
                  "Cannot get memory properties for pointer argument (at %d, err=%d)", idx, res);
     ptr_info->valid = false;
   }} else if (prop.type == ZE_MEMORY_TYPE_UNKNOWN) {{
-    // We can work with any memory, known to the driver:
-    // ZE_MEMORY_TYPE_DEVICE, ZE_MEMORY_TYPE_SHARED, ZE_MEMORY_TYPE_HOST
     PyErr_Format(PyExc_ValueError,
                  "Pointer argument (at %d) doesn't reference accessible memory.", idx);
     ptr_info->valid = false;
@@ -602,7 +627,6 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx, const sycl::queue
     return ptr_info;
   }}
   if (obj == Py_None) {{
-    // valid nullptr
     return ptr_info;
   }}
   PyObject *ptr = PyObject_GetAttrString(obj, "data_ptr");
@@ -621,7 +645,7 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx, const sycl::queue
       return ptr_info;
     }}
     checkDevicePointer(&ptr_info, idx, queue);
-    Py_DECREF(ret);  // Thanks ChatGPT!
+    Py_DECREF(ret);
     return ptr_info;
   }}
   PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
@@ -629,77 +653,54 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx, const sycl::queue
   return ptr_info;
 }}
 
-// start sycl
-template <class T>
-static inline void set_scalar_arg(sycl::handler &cgh, int index, const void *value) {{
-  cgh.set_arg(index, *static_cast<const T *>(value));
-}}
+static void l0_kernel_launch(uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+                              int num_warps, int threads_per_warp, int shared_memory,
+                              sycl::queue& stream, L0KernelBundle* bundle,
+                              void* global_scratch, void* profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
 
-static void sycl_kernel_launch(uint32_t gridX, uint32_t gridY, uint32_t gridZ,
-                               int num_warps, int threads_per_warp, int shared_memory,
-                               sycl::queue& stream, sycl::kernel& kernel_ptr,
-                               void* global_scratch, void* profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
-
-  std::string kernel_name = kernel_ptr.get_info<sycl::info::kernel::function_name>();
-  { 'RECORD_FUNCTION("XPU Triton kernel:" + kernel_name, {});' if COMPILATION_HELPER.inject_pytorch_dep else "" }
+  { 'RECORD_FUNCTION("XPU Triton kernel (L0)", {});' if COMPILATION_HELPER.inject_pytorch_dep else "" }
 
   {params_decl};
   uint32_t num_params = {num_params};
-  uint32_t expected_num_params = kernel_ptr.get_info<sycl::info::kernel::num_args>();
-  size_t global_range_x = gridX*threads_per_warp*num_warps;
-  size_t global_range_y = gridY;
-  size_t global_range_z = gridZ;
-  size_t local_range_x = num_warps*threads_per_warp;
-  size_t local_range_y = 1;
-  size_t local_range_z = 1;
-  sycl::range<3> global_range(global_range_z, global_range_y, global_range_x);
-  sycl::range<3> local_range(local_range_z, local_range_y, local_range_x);
-  sycl::nd_range<3> parallel_work_size(global_range, local_range);
-  if (shared_memory) {{
-    expected_num_params -= 1;
+
+  const auto& l0_state = get_or_create_l0_state(stream);
+  ze_command_list_handle_t imm_cmdl = l0_state.imm_cmdl;
+  ze_kernel_handle_t kernel = bundle->kernel;
+
+  ze_group_count_t dispatch{{}};
+  dispatch.groupCountX = gridX;
+  dispatch.groupCountY = gridY;
+  dispatch.groupCountZ = gridZ;
+
+  ze_group_size_t group_size{{}};
+  group_size.groupSizeX = static_cast<uint32_t>(num_warps * threads_per_warp);
+  group_size.groupSizeY = 1;
+  group_size.groupSizeZ = 1;
+
+  size_t slm_size_val = static_cast<size_t>(shared_memory);
+  void* arg_ptrs[{num_params + 1}];
+  for (uint32_t i = 0; i < num_params; i++) {{
+    arg_ptrs[i] = params[i];
+  }}
+  if (shared_memory > 0) {{
+    arg_ptrs[num_params] = &slm_size_val;
   }}
 
-  static bool launchDebug = getBoolEnv("TRITON_INTEL_LAUNCH_DEBUG");
-  if (launchDebug){{
-    std::cout << "kernel info name:" << kernel_name << " @" << &kernel_ptr << std::endl;
-    std::cout << "kernel info attributes:" << kernel_ptr.get_info<sycl::info::kernel::attributes>() << std::endl;
-    std::cout << "kernel info reference_count:" << kernel_ptr.get_info<sycl::info::kernel::reference_count>() << std::endl;
-    std::cout << "kernel info num_args:" << kernel_ptr.get_info<sycl::info::kernel::num_args>() << std::endl;
-
-    std::cout << "launch num param:" << num_params << std::endl;
-    std::cout << "  gridx: " << gridX << std::endl;
-    std::cout << "  gridY: " << gridY << std::endl;
-    std::cout << "  gridZ: " << gridZ << std::endl;
-    std::cout << "  num_warps: " << num_warps << std::endl;
-    std::cout << "  threads_per_warp: " << threads_per_warp << std::endl;
-    std::cout << "  global range:[" << "x:"<< global_range_x << ", y:" << global_range_y << ", z:" << global_range_z << "]" << std::endl;
-    std::cout << "  local range:[" << "x:"<< local_range_x << ", y:" << local_range_y << ", z:" << local_range_z << "]" << std::endl;
-    std::cout << "  shared_memory: " << shared_memory << std::endl;
-
-    // param
-    {" ".join(f'std::cout << "  param {idx}:" << *({ty_to_cpp(item)}*)params[{idx}] << std::endl;' for idx, item in enumerate([signature[i] for i in signature if signature[i] != "constexpr"]))}
+  ze_result_t lr = zeCommandListAppendLaunchKernelWithArguments(
+      imm_cmdl, kernel, dispatch, group_size,
+      arg_ptrs, nullptr, nullptr, 0, nullptr);
+  if (lr != ZE_RESULT_SUCCESS) {{
+    const char* prefix = "Triton Error [ZE]: zeCommandListAppendLaunchKernelWithArguments failed: ";
+    std::string str = std::to_string(lr);
+    char err[1024] = {{0}};
+    strcat(err, prefix);
+    strcat(err, str.c_str());
+    PyErr_SetString(PyExc_RuntimeError, err);
   }}
-  assert(num_params == expected_num_params && "number of kernel param not matched");
-  // Submit the imported kernel.
-  auto cgf = [&](sycl::handler &cgh) {{
-    {" ".join(f'set_scalar_arg<{ty_to_cpp(item)}>(cgh, {idx}, params[{idx}]);' for idx, item in enumerate([signature[i] for i in signature if signature[i] != "constexpr"]))}
-    {" ".join(f'set_scalar_arg<{ty_to_cpp(item)}>(cgh, {idx}, params[{idx}]);' for idx, item in enumerate(["*global_scratch", "*profile_scratch"], start=num_params-2))}
-    if (shared_memory) {{
-      using share_mem_t = sycl::local_accessor<int8_t, 1>;
-      share_mem_t local_buffer = share_mem_t(shared_memory, cgh);
-      cgh.set_arg(num_params, local_buffer);
-      cgh.parallel_for(parallel_work_size, kernel_ptr);
-    }} else {{
-      cgh.parallel_for(parallel_work_size, kernel_ptr);
-    }}
-  }};
-  auto event = stream.submit(cgf);
 }}
-// end sycl
 
 static uint16_t pack_fp16(double f) {{
     uint16_t result;
-    // from https://github.com/python/pythoncapi-compat
 #if 0x030600B1 <= PY_VERSION_HEX && PY_VERSION_HEX <= 0x030B00A1 && !defined(PYPY_VERSION)
     _PyFloat_Pack2(f, (unsigned char *)&result, 1);
 #else
@@ -742,7 +743,6 @@ extern "C" EXPORT_FUNC PyObject* launch(PyObject* args) {{
     return NULL;
   }}
 
-  // extract kernel metadata
   PyObject *num_warps_attr = PyObject_GetAttrString(kernel_metadata, "num_warps");
   int num_warps = PyLong_AsLong(num_warps_attr);
   Py_DECREF(num_warps_attr);
@@ -756,7 +756,6 @@ extern "C" EXPORT_FUNC PyObject* launch(PyObject* args) {{
   int threads_per_warp = PyLong_AsLong(threads_per_warp_attr);
   Py_DECREF(threads_per_warp_attr);
 
-  // extract launch metadata
   if (launch_enter_hook != Py_None){{
     PyObject* ret = PyObject_CallOneArg(launch_enter_hook, launch_metadata);
     if (!ret)
@@ -765,17 +764,16 @@ extern "C" EXPORT_FUNC PyObject* launch(PyObject* args) {{
   }}
 
   void * pStream = PyLong_AsVoidPtr(py_obj_stream);
-  //error check
   if(pStream == nullptr || py_kernel == nullptr) return NULL;
 
   sycl::queue stream = *(static_cast<sycl::queue*>(pStream));
-  sycl::kernel* kernel_ptr = reinterpret_cast<sycl::kernel*>(PyCapsule_GetPointer(py_kernel, "kernel"));
-  if(kernel_ptr == nullptr) return NULL;
-  sycl::kernel kernel = *kernel_ptr;
+  L0KernelBundle* l0_bundle = reinterpret_cast<L0KernelBundle*>(
+      PyCapsule_GetPointer(py_kernel, "l0_kernel_bundle"));
+  if(l0_bundle == nullptr) return NULL;
 
   {newline.join(ptr_decls)}
   {newline.join(float_storage_decls)}
-  sycl_kernel_launch(gridX, gridY, gridZ, num_warps, threads_per_warp, shared_memory, stream, kernel, global_scratch, profile_scratch{',' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
+  l0_kernel_launch(gridX, gridY, gridZ, num_warps, threads_per_warp, shared_memory, stream, l0_bundle, global_scratch, profile_scratch{',' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
   if (PyErr_Occurred()) {{
     return NULL;
   }}
@@ -794,9 +792,6 @@ extern "C" EXPORT_FUNC PyObject* launch(PyObject* args) {{
 
 
 def _make_intel_tensordesc_arg(arg, _meta, _base_args):
-    # Intel does not use TMA descriptors, so _meta (tensordesc metadata) and
-    # _base_args (launcher base arguments) are unused.  We simply decompose the
-    # TensorDescriptor into base pointer, shape, strides, and flags.
     return decompose_descriptor(arg)
 
 
@@ -852,14 +847,8 @@ def serialize_args(args, constants, signature):
 
     cnt = 0
     args_dict = {"gridX": int(args[cnt]), "gridY": int(args[cnt + 1]), "gridZ": int(args[cnt + 2])}
-    # 3: stream
-    # 4: function
-    # 5: packed kernel metadata
     assert type(args[cnt + 5]).__name__ == "KernelMetadata"
     serialize_kernel_metadata(args[cnt + 5], args_dict)
-    # 6: launch_metadata
-    # 7: launch_enter_hook
-    # 8: launch_exit_hook
     args_dict['argument_list'] = []
     counts = {"tensors": 0, "scalars": 0, "karg_cnt": 0}
     cnt += 9
@@ -886,14 +875,13 @@ def serialize_args(args, constants, signature):
             counts['scalars'] += 1
         counts['karg_cnt'] += 1
 
-    # Dump argument info as a JSON file
     json_path = os.path.join(dir_path, 'args_data.json')
     with open(json_path, 'w') as json_file:
         import json
         json.dump(args_dict, json_file, indent=4)
 
 
-class XPULauncher(object):
+class XPULauncher:
 
     def __init__(self, src, metadata):
         constants = src.constants if hasattr(src, "constants") else dict()
@@ -903,15 +891,11 @@ class XPULauncher(object):
         src = make_launcher(constants, signature)
         self.mod = compile_module_from_src(src=src, name="__triton_launcher")
         self.launch = wrap_handle_tensordesc(self.mod.launch, signature)
-
-        # Serialize KernelArguments for SPIR-V Runner
         self.serialize_kernel_args = knobs.intel.dump_spirv_kernel_args
         self.constants = constants
         self.signature = signature
 
     def _dump_launch_params(self, args, constants, signature):
-        # inspired by `def _dump_launch_params(args, kwargs, launcher, kernel_name, grid):` from
-        # torch/_inductor/runtime/triton_heuristics.py
         grid = args[:3]
         new_args = args[9:]
         call_args = []
@@ -922,20 +906,16 @@ class XPULauncher(object):
             else:
                 call_args.append(str(arg))
 
-        # handle kwargs
         signature = list(signature.keys())
         for idx, value in constants.items():
-            # In general this is not the case, but it is sufficient for llama 3.1 kernels
             assert len(idx) == 1
             call_kwargs[signature[idx[0]]] = value
         call_kwargs["num_warps"] = args[5].num_warps
         call_kwargs["num_stages"] = args[5].num_stages
 
-        # adjust args
         constants = [(idx[0], value) for idx, value in constants.items()]
         constants = sorted(constants, reverse=True)
         for idx, _ in constants:
-            # it have been added as kwargs
             call_args.pop(idx)
 
         args_str = [*call_args]
@@ -953,8 +933,6 @@ class XPULauncher(object):
             serialize_args(args, self.constants, self.signature)
 
         if os.environ.get("TRITON_DUMP_LAUNCH_PARAMS") == "1":
-            # This function does not cover all cases, for example when the arguments are tuple,
-            # but it is sufficient for llama 3.1 kernels
             self._dump_launch_params(args, self.constants, self.signature)
 
         self.launch(args)
@@ -967,13 +945,10 @@ class XPUDriver(DriverBase):
         super().__init__()
 
     def __getattr__(self, name):
-        # Lazily initialize utils to avoid unnecessary XPU runtime invocations.
-        # See https://github.com/intel/intel-xpu-backend-for-triton/issues/624
         if name == "utils":
             self.utils = XPUUtils()
             return self.utils
-        else:
-            raise AttributeError
+        raise AttributeError
 
     def get_current_device(self):
         return self.utils.get_current_device()
@@ -997,8 +972,6 @@ class XPUDriver(DriverBase):
                 arch = parser.parse_device_arch(dev_property["architecture"])
             dev_property["arch"] = arch
 
-        # All GPUs with the same device_id have the same extensions, so we just
-        # need to query any GPU device
         device_id = dev_property.get("device_id")
         extensions = query_device_extensions(device_id)
         dev_property.update(extensions)
@@ -1038,10 +1011,6 @@ class XPUDriver(DriverBase):
 
     def get_empty_cache_for_benchmark(self):
         import torch
-
-        # We maintain a buffer of 256 MB that we clear
-        # before each kernel call to make sure that the L2 cache
-        # doesn't contain any input data before the run
         cache_size = 256 * 1024 * 1024
         return torch.empty(int(cache_size // 4), dtype=torch.int, device='xpu')
 
